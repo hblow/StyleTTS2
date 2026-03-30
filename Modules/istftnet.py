@@ -497,15 +497,23 @@ class Decoder(nn.Module):
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size)
         
     def forward(self, asr, F0_curve, N, s):
+        # Ensure F0_curve and N are 2D [batch, length]
+        F0_curve = F0_curve.squeeze()
+        N = N.squeeze()
+        if F0_curve.dim() == 1:
+            F0_curve = F0_curve.unsqueeze(0)
+        if N.dim() == 1:
+            N = N.unsqueeze(0)
+        
         if self.training:
             downlist = [0, 3, 7]
             F0_down = downlist[random.randint(0, 2)]
             downlist = [0, 3, 7, 15]
             N_down = downlist[random.randint(0, 3)]
             if F0_down:
-                F0_curve = nn.functional.conv1d(F0_curve.unsqueeze(1), torch.ones(1, 1, F0_down).to('cuda'), padding=F0_down//2).squeeze(1) / F0_down
+                F0_curve = nn.functional.conv1d(F0_curve.unsqueeze(1), torch.ones(1, 1, F0_down, device=F0_curve.device), padding=F0_down//2).squeeze(1) / F0_down
             if N_down:
-                N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down).to('cuda'), padding=N_down//2).squeeze(1)  / N_down
+                N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down, device=N.device), padding=N_down//2).squeeze(1)  / N_down
 
         
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
