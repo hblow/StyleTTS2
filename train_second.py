@@ -31,6 +31,12 @@ from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSche
 
 from optimizers import build_optimizer
 
+from accelerate import Accelerator
+from accelerate import DistributedDataParallelKwargs
+        
+import logging
+from accelerate.logging import get_logger
+
 # simple fix for dataparallel that allows access to class attributes
 class MyDataParallel(torch.nn.DataParallel):
     def __getattr__(self, name):
@@ -38,14 +44,6 @@ class MyDataParallel(torch.nn.DataParallel):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.module, name)
-        
-import logging
-from logging import StreamHandler
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-handler = StreamHandler()
-handler.setLevel(logging.DEBUG)
-logger.addHandler(handler)
 
 
 @click.command()
@@ -53,16 +51,41 @@ logger.addHandler(handler)
 def main(config_path):
     config = yaml.safe_load(open(config_path))
     
+    # Read DDP/DP mode flag early
+    use_ddp = config.get('use_ddp', True)
+    
     log_dir = config['log_dir']
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
-    writer = SummaryWriter(log_dir + "/tensorboard")
+    
+    if use_ddp:
+        # Initialize Accelerator with DDP kwargs
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(project_dir=log_dir, split_batches=True, kwargs_handlers=[ddp_kwargs])
+        device = accelerator.device
+        # Use accelerate logger for DDP
+        logger = get_logger(__name__, log_level="DEBUG")
+        # Only main process creates tensorboard writer
+        if accelerator is None or accelerator.is_main_process:
+            writer = SummaryWriter(log_dir + "/tensorboard")
+    else:
+        # DP mode: no accelerator
+        accelerator = None
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Use standard logger for DP
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.DEBUG)
+        # Always create writer in DP mode
+        writer = SummaryWriter(log_dir + "/tensorboard")
 
-    # write logs
+    # write logs (shared between modes)
     file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
-    logger.addHandler(file_handler)
+    if use_ddp:
+        logger.logger.addHandler(file_handler)
+    else:
+        logger.addHandler(file_handler)
 
     
     batch_size = config.get('batch_size', 10)
@@ -89,7 +112,6 @@ def main(config_path):
     optimizer_params = Munch(config['optimizer_params'])
     
     train_list, val_list = get_data_path_list(train_path, val_path)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,
@@ -110,6 +132,10 @@ def main(config_path):
                                       device=device,
                                       dataset_config={})
     
+    # Prepare dataloaders with accelerator (DDP only)
+    if use_ddp:
+        train_dataloader, val_dataloader = accelerator.prepare(train_dataloader, val_dataloader)
+    
     # load pretrained ASR model
     ASR_config = config.get('ASR_config', False)
     ASR_path = config.get('ASR_path', False)
@@ -129,10 +155,15 @@ def main(config_path):
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
     
-    # DP
-    for key in model:
-        if key != "mpd" and key != "msd" and key != "wd":
-            model[key] = MyDataParallel(model[key])
+    # Prepare models: DDP uses accelerator, DP uses MyDataParallel
+    if use_ddp:
+        for key in model:
+            model[key] = accelerator.prepare(model[key])
+    else:
+        # DP mode: wrap models with MyDataParallel (except mpd, msd, wd)
+        for key in model:
+            if key != "mpd" and key != "msd" and key != "wd":
+                model[key] = MyDataParallel(model[key])
             
     start_epoch = 0
     iters = 0
@@ -165,12 +196,22 @@ def main(config_path):
                    sr, 
                    model_params.slm.sr).to(device)
 
-    gl = MyDataParallel(gl)
-    dl = MyDataParallel(dl)
-    wl = MyDataParallel(wl)
+    # Prepare loss functions: DDP uses accelerator, DP uses MyDataParallel
+    if use_ddp:
+        gl = accelerator.prepare(gl)
+        dl = accelerator.prepare(dl)
+        wl = accelerator.prepare(wl)
+        # Get unwrapped diffusion model for sampler (handles DDP wrapper)
+        diffusion_model = model.diffusion.module.diffusion if hasattr(model.diffusion, 'module') else model.diffusion.diffusion
+    else:
+        # DP mode: wrap loss functions with MyDataParallel
+        gl = MyDataParallel(gl)
+        dl = MyDataParallel(dl)
+        wl = MyDataParallel(wl)
+        diffusion_model = model.diffusion.diffusion
     
     sampler = DiffusionSampler(
-        model.diffusion.diffusion,
+        diffusion_model,
         sampler=ADPM2Sampler(),
         sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0), # empirical parameters
         clamp=False
@@ -189,6 +230,12 @@ def main(config_path):
     
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
                                           scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
+    
+    # Prepare optimizers and schedulers: DDP uses accelerator, DP does not
+    if use_ddp:
+        for k, v in optimizer.optimizers.items():
+            optimizer.optimizers[k] = accelerator.prepare(optimizer.optimizers[k])
+            optimizer.schedulers[k] = accelerator.prepare(optimizer.schedulers[k])
     
     # adjust BERT learning rate
     for g in optimizer.optimizers['bert'].param_groups:
@@ -212,7 +259,11 @@ def main(config_path):
         model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
                                     load_only_params=config.get('load_only_params', True))
         
-    n_down = model.text_aligner.n_down
+    # Handle DDP wrapper for n_down access
+    try:
+        n_down = model.text_aligner.module.n_down
+    except:
+        n_down = model.text_aligner.n_down
 
     best_loss = float('inf')  # best test loss
     loss_train_record = list([])
@@ -225,8 +276,9 @@ def main(config_path):
     
     stft_loss = MultiResolutionSTFTLoss().to(device)
     
-    print('BERT', optimizer.optimizers['bert'])
-    print('decoder', optimizer.optimizers['decoder'])
+    if accelerator is None or accelerator.is_main_process:
+        print('BERT', optimizer.optimizers['bert'])
+        print('decoder', optimizer.optimizers['decoder'])
 
     start_ds = False
     
@@ -303,8 +355,8 @@ def main(config_path):
                 s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                 gs.append(s)
 
-            s_dur = torch.stack(ss).squeeze()  # global prosodic styles
-            gs = torch.stack(gs).squeeze() # global acoustic styles
+            s_dur = torch.stack(ss).squeeze(dim=1)  # global prosodic styles
+            gs = torch.stack(gs).squeeze(dim=1) # global acoustic styles
             s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
@@ -408,7 +460,10 @@ def main(config_path):
             if start_ds:
                 optimizer.zero_grad()
                 d_loss = dl(wav.detach(), y_rec.detach()).mean()
-                d_loss.backward()
+                if use_ddp:
+                    accelerator.backward(d_loss)
+                else:
+                    d_loss.backward()
                 optimizer.step('msd')
                 optimizer.step('mpd')
             else:
@@ -452,7 +507,10 @@ def main(config_path):
                      loss_params.lambda_diff * loss_diff
 
             running_loss += loss_mel.item()
-            g_loss.backward()
+            if use_ddp:
+                accelerator.backward(g_loss)
+            else:
+                g_loss.backward()
             if torch.isnan(g_loss):
                 from IPython.core.debugger import set_trace
                 set_trace()
@@ -494,7 +552,10 @@ def main(config_path):
                 
                 # SLM generator loss
                 optimizer.zero_grad()
-                loss_gen_lm.backward()
+                if use_ddp:
+                    accelerator.backward(loss_gen_lm)
+                else:
+                    loss_gen_lm.backward()
 
                 # compute the gradient norm
                 total_norm = {}
@@ -533,7 +594,10 @@ def main(config_path):
                 # SLM discriminator loss
                 if d_loss_slm != 0:
                     optimizer.zero_grad()
-                    d_loss_slm.backward(retain_graph=True)
+                    if use_ddp:
+                        accelerator.backward(d_loss_slm, retain_graph=True)
+                    else:
+                        d_loss_slm.backward(retain_graph=True)
                     optimizer.step('wd')
 
             else:
@@ -542,25 +606,26 @@ def main(config_path):
             iters = iters + 1
             
             if (i+1)%log_interval == 0:
-                logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f'
-                    %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm))
-                
-                writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
-                writer.add_scalar('train/gen_loss', loss_gen_all, iters)
-                writer.add_scalar('train/d_loss', d_loss, iters)
-                writer.add_scalar('train/ce_loss', loss_ce, iters)
-                writer.add_scalar('train/dur_loss', loss_dur, iters)
-                writer.add_scalar('train/slm_loss', loss_lm, iters)
-                writer.add_scalar('train/norm_loss', loss_norm_rec, iters)
-                writer.add_scalar('train/F0_loss', loss_F0_rec, iters)
-                writer.add_scalar('train/sty_loss', loss_sty, iters)
-                writer.add_scalar('train/diff_loss', loss_diff, iters)
-                writer.add_scalar('train/d_loss_slm', d_loss_slm, iters)
-                writer.add_scalar('train/gen_loss_slm', loss_gen_lm, iters)
-                
-                running_loss = 0
-                
-                print('Time elasped:', time.time()-start_time)
+                if accelerator is None or accelerator.is_main_process:
+                    logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f'
+                        %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm))
+                    
+                    writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
+                    writer.add_scalar('train/gen_loss', loss_gen_all, iters)
+                    writer.add_scalar('train/d_loss', d_loss, iters)
+                    writer.add_scalar('train/ce_loss', loss_ce, iters)
+                    writer.add_scalar('train/dur_loss', loss_dur, iters)
+                    writer.add_scalar('train/slm_loss', loss_lm, iters)
+                    writer.add_scalar('train/norm_loss', loss_norm_rec, iters)
+                    writer.add_scalar('train/F0_loss', loss_F0_rec, iters)
+                    writer.add_scalar('train/sty_loss', loss_sty, iters)
+                    writer.add_scalar('train/diff_loss', loss_diff, iters)
+                    writer.add_scalar('train/d_loss_slm', d_loss_slm, iters)
+                    writer.add_scalar('train/gen_loss_slm', loss_gen_lm, iters)
+                    
+                    running_loss = 0
+                    
+                    print('Time elasped:', time.time()-start_time)
                 
         loss_test = 0
         loss_align = 0
@@ -605,8 +670,8 @@ def main(config_path):
                         s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                         gs.append(s)
 
-                    s = torch.stack(ss).squeeze()
-                    gs = torch.stack(gs).squeeze()
+                    s = torch.stack(ss).squeeze(dim=1)
+                    gs = torch.stack(gs).squeeze(dim=1)
                     s_trg = torch.cat([s, gs], dim=-1).detach()
 
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
@@ -676,118 +741,121 @@ def main(config_path):
                     traceback.print_exc()
                     continue
 
-        print('Epochs:', epoch + 1)
-        logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n')
-        print('\n\n\n')
-        writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
-        writer.add_scalar('eval/dur_loss', loss_align / iters_test, epoch + 1)
-        writer.add_scalar('eval/F0_loss', loss_f / iters_test, epoch + 1)
+        if accelerator is None or accelerator.is_main_process:
+            print('Epochs:', epoch + 1)
+            logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n')
+            print('\n\n\n')
+            writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
+            writer.add_scalar('eval/dur_loss', loss_align / iters_test, epoch + 1)
+            writer.add_scalar('eval/F0_loss', loss_f / iters_test, epoch + 1)
         
         if epoch < joint_epoch:
             # generating reconstruction examples with GT duration
-            
-            with torch.no_grad():
-                for bib in range(len(asr)):
-                    mel_length = int(mel_input_length[bib].item())
-                    gt = mels[bib, :, :mel_length].unsqueeze(0)
-                    en = asr[bib, :, :mel_length // 2].unsqueeze(0)
+            if accelerator is None or accelerator.is_main_process:
+                with torch.no_grad():
+                    for bib in range(len(asr)):
+                        mel_length = int(mel_input_length[bib].item())
+                        gt = mels[bib, :, :mel_length].unsqueeze(0)
+                        en = asr[bib, :, :mel_length // 2].unsqueeze(0)
 
-                    F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
-                    F0_real = F0_real.unsqueeze(0)
-                    s = model.style_encoder(gt.unsqueeze(1))
-                    real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
+                        F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
+                        F0_real = F0_real.unsqueeze(0)
+                        s = model.style_encoder(gt.unsqueeze(1))
+                        real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
 
-                    y_rec = model.decoder(en, F0_real, real_norm, s)
+                        y_rec = model.decoder(en, F0_real, real_norm, s)
 
-                    writer.add_audio('eval/y' + str(bib), y_rec.cpu().numpy().squeeze(), epoch, sample_rate=sr)
+                        writer.add_audio('eval/y' + str(bib), y_rec.cpu().numpy().squeeze(), epoch, sample_rate=sr)
 
-                    s_dur = model.predictor_encoder(gt.unsqueeze(1))
-                    p_en = p[bib, :, :mel_length // 2].unsqueeze(0)
+                        s_dur = model.predictor_encoder(gt.unsqueeze(1))
+                        p_en = p[bib, :, :mel_length // 2].unsqueeze(0)
 
-                    F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
+                        F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
 
-                    y_pred = model.decoder(en, F0_fake, N_fake, s)
+                        y_pred = model.decoder(en, F0_fake, N_fake, s)
 
-                    writer.add_audio('pred/y' + str(bib), y_pred.cpu().numpy().squeeze(), epoch, sample_rate=sr)
+                        writer.add_audio('pred/y' + str(bib), y_pred.cpu().numpy().squeeze(), epoch, sample_rate=sr)
 
-                    if epoch == 0:
-                        writer.add_audio('gt/y' + str(bib), waves[bib].squeeze(), epoch, sample_rate=sr)
+                        if epoch == 0:
+                            writer.add_audio('gt/y' + str(bib), waves[bib].squeeze(), epoch, sample_rate=sr)
 
-                    if bib >= 5:
-                        break
+                        if bib >= 5:
+                            break
         else:
             # generating sampled speech from text directly
-            with torch.no_grad():
-                # compute reference styles
-                if multispeaker and epoch >= diff_epoch:
-                    ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
-                    ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
-                    ref_s = torch.cat([ref_ss, ref_sp], dim=1)
-                    
-                for bib in range(len(d_en)):
-                    if multispeaker:
-                        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
-                              embedding=bert_dur[bib].unsqueeze(0),
-                              embedding_scale=1,
-                                features=ref_s[bib].unsqueeze(0), # reference from the same speaker as the embedding
-                                 num_steps=5).squeeze(1)
-                    else:
-                        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
-                              embedding=bert_dur[bib].unsqueeze(0),
-                              embedding_scale=1,
-                                 num_steps=5).squeeze(1)
+            if accelerator is None or accelerator.is_main_process:
+                with torch.no_grad():
+                    # compute reference styles
+                    if multispeaker and epoch >= diff_epoch:
+                        ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
+                        ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
+                        ref_s = torch.cat([ref_ss, ref_sp], dim=1)
+                        
+                    for bib in range(len(d_en)):
+                        if multispeaker:
+                            s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
+                                  embedding=bert_dur[bib].unsqueeze(0),
+                                  embedding_scale=1,
+                                    features=ref_s[bib].unsqueeze(0), # reference from the same speaker as the embedding
+                                     num_steps=5).squeeze(1)
+                        else:
+                            s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
+                                  embedding=bert_dur[bib].unsqueeze(0),
+                                  embedding_scale=1,
+                                     num_steps=5).squeeze(1)
 
-                    s = s_pred[:, 128:]
-                    ref = s_pred[:, :128]
+                        s = s_pred[:, 128:]
+                        ref = s_pred[:, :128]
 
-                    d = model.predictor.text_encoder(d_en[bib, :, :input_lengths[bib]].unsqueeze(0), 
-                                                     s, input_lengths[bib, ...].unsqueeze(0), text_mask[bib, :input_lengths[bib]].unsqueeze(0))
+                        d = model.predictor.text_encoder(d_en[bib, :, :input_lengths[bib]].unsqueeze(0), 
+                                                         s, input_lengths[bib, ...].unsqueeze(0), text_mask[bib, :input_lengths[bib]].unsqueeze(0))
 
-                    x, _ = model.predictor.lstm(d)
-                    duration = model.predictor.duration_proj(x)
+                        x, _ = model.predictor.lstm(d)
+                        duration = model.predictor.duration_proj(x)
 
-                    duration = torch.sigmoid(duration).sum(axis=-1)
-                    pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+                        duration = torch.sigmoid(duration).sum(axis=-1)
+                        pred_dur = torch.round(duration.squeeze()).clamp(min=1)
 
-                    pred_dur[-1] += 5
+                        pred_dur[-1] += 5
 
-                    pred_aln_trg = torch.zeros(input_lengths[bib], int(pred_dur.sum().data))
-                    c_frame = 0
-                    for i in range(pred_aln_trg.size(0)):
-                        pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
-                        c_frame += int(pred_dur[i].data)
+                        pred_aln_trg = torch.zeros(input_lengths[bib], int(pred_dur.sum().data))
+                        c_frame = 0
+                        for i in range(pred_aln_trg.size(0)):
+                            pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
+                            c_frame += int(pred_dur[i].data)
 
-                    # encode prosody
-                    en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(texts.device))
-                    F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
-                    out = model.decoder((t_en[bib, :, :input_lengths[bib]].unsqueeze(0) @ pred_aln_trg.unsqueeze(0).to(texts.device)), 
-                                            F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+                        # encode prosody
+                        en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(texts.device))
+                        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+                        out = model.decoder((t_en[bib, :, :input_lengths[bib]].unsqueeze(0) @ pred_aln_trg.unsqueeze(0).to(texts.device)), 
+                                                F0_pred, N_pred, ref.squeeze().unsqueeze(0))
 
-                    writer.add_audio('pred/y' + str(bib), out.cpu().numpy().squeeze(), epoch, sample_rate=sr)
+                        writer.add_audio('pred/y' + str(bib), out.cpu().numpy().squeeze(), epoch, sample_rate=sr)
 
-                    if bib >= 5:
-                        break
+                        if bib >= 5:
+                            break
                             
-        if epoch % saving_epoch == 0:
-            if (loss_test / iters_test) < best_loss:
-                best_loss = loss_test / iters_test
-            print('Saving..')
-            state = {
-                'net':  {key: model[key].state_dict() for key in model}, 
-                'optimizer': optimizer.state_dict(),
-                'iters': iters,
-                'val_loss': loss_test / iters_test,
-                'epoch': epoch,
-            }
-            save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
-            torch.save(state, save_path)
-            
-            # if estimate sigma, save the estimated simga
-            if model_params.diffusion.dist.estimate_sigma_data:
-                config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
+        if accelerator is None or accelerator.is_main_process:
+            if epoch % saving_epoch == 0:
+                if (loss_test / iters_test) < best_loss:
+                    best_loss = loss_test / iters_test
+                print('Saving..')
+                state = {
+                    'net':  {key: model[key].state_dict() for key in model}, 
+                    'optimizer': optimizer.state_dict(),
+                    'iters': iters,
+                    'val_loss': loss_test / iters_test,
+                    'epoch': epoch,
+                }
+                save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
+                torch.save(state, save_path)
                 
-                with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
-                    yaml.dump(config, outfile, default_flow_style=True)
+                # if estimate sigma, save the estimated simga
+                if model_params.diffusion.dist.estimate_sigma_data:
+                    config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
+                    
+                    with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
+                        yaml.dump(config, outfile, default_flow_style=True)
         
 if __name__=="__main__":
     main()
